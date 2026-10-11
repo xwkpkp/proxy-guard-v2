@@ -1,0 +1,171 @@
+// proxy-guard 跨语言控制契约
+//
+// 这是三层（Rust 数据面 / Go 控制面 / Python AI 层）唯一的共享语言。
+// 任何跨层交互必须先改本文件，再实现。
+//
+// 传输实现注记（v2 实施阶段）：
+//   v2.0 实现采用 JSON over HTTP(127.0.0.1) 承载本契约的消息——JSON 字段名与
+//   本文件字段名逐字对应（snake_case 为准）。gRPC/tonic 是本契约的规划升级路径：
+//   届时 proto 直接作为 codegen 源，消息定义无需变更。
+//
+// 拓扑：
+//   Rust ctrl server (127.0.0.1:<ctrl_port>, token 认证) —— 数据面的控制入口
+//     POST /snapshot   Go → Rust   全量快照，原子生效
+//     POST /policy     Go → Rust   增量策略（黑名单/降权）
+//     GET  /events     Go ← Rust   SSE 事件流（Rust 命中即推）
+//     GET  /metrics    Go ← Rust   指标快照
+//   Go HTTP API (127.0.0.1:8891)
+//     POST /internal/verdict   Python → Go   研判结果回写
+//   Python AI (127.0.0.1:8892)
+//     POST /judge      Go → Python           事件入队（立即 202）
+
+syntax = "proto3";
+
+package proxyguard.control.v1;
+
+// ---------------------------------------------------------------------------
+// 服务定义（gRPC 升级路径的形态；JSON 实现按上方 HTTP 路由映射）
+// ---------------------------------------------------------------------------
+
+service Control {
+  // Go → Rust：全量配置快照。version 单调递增，Rust 拒绝旧版本。
+  rpc PushSnapshot(ConfigSnapshot) returns (SnapshotAck);
+
+  // Go → Rust：增量策略（黑名单增删、规则降权）。基于 base_version 生效。
+  rpc PushPolicy(PolicyDelta) returns (Ack);
+
+  // Go ← Rust：事件流。Rust 侧检测命中/出口切换等事件实时推送。
+  rpc WatchEvents(WatchRequest) returns (stream ThreatEvent);
+
+  // Go ← Rust：指标。批量上报。
+  rpc ReportMetrics(stream MetricBatch) returns (Ack);
+}
+
+// ---------------------------------------------------------------------------
+// 配置快照
+// ---------------------------------------------------------------------------
+
+message ConfigSnapshot {
+  uint64 version = 1;              // 单调递增
+  int64 issued_at = 2;             // unix 秒
+  repeated string pool = 3;        // 候选出口 "ip:port"
+  RoutingTable routing = 4;
+  Policy policy = 5;
+  repeated string blacklist = 6;   // 永久拉黑的出口
+}
+
+message SnapshotAck {
+  bool accepted = 1;               // false = version 过旧被拒
+  uint64 current_version = 2;      // Rust 侧当前生效版本
+  string reason = 3;
+}
+
+message RoutingTable {
+  string mode = 1;                 // auto | direct_all | proxy_all
+  repeated string direct_domains = 2;
+  repeated string direct_suffixes = 3;   // 如 ".cn"
+  repeated string proxy_domains = 4;     // 强制走代理
+}
+
+message Policy {
+  RotationPolicy rotation = 1;
+  bool scan_request = 2;
+  bool scan_response = 3;
+  bool block_on_detect = 4;
+  bool switch_on_detect = 5;
+  bool mitm_enabled = 6;
+  int64 max_body_scan = 7;         // 扫描上限字节
+  int32 circuit_threshold = 8;     // 熔断：连续失败数
+  int32 circuit_cooldown_s = 9;
+  int32 max_concurrent = 10;
+  bool redline_enabled = 11;       // 数据红线
+  bool ssrf_protect = 12;
+  bool csp_inject = 13;
+  bool detect_injection = 14;      // 响应注入检测
+
+  // 研判结果处置：
+  //   log_only  = 仅记录；block = 命中目标加入拦截；demote = 规则降权
+  string llm_malicious_action = 15;
+  string llm_suspicious_action = 16;
+}
+
+message RotationPolicy {
+  string strategy = 1;             // round_robin | fastest | least_used | random
+  int32 switch_interval_s = 2;     // 定时切换
+  int32 max_failures = 3;          // 连续失败 N 次本地切换
+  int32 cooldown_s = 4;            // 失效出口冷却
+}
+
+// ---------------------------------------------------------------------------
+// 增量策略（研判回写）
+// ---------------------------------------------------------------------------
+
+message PolicyDelta {
+  uint64 base_version = 1;             // 基于哪个快照版本
+  repeated string add_blacklist = 2;   // 新增拉黑出口
+  repeated string remove_blacklist = 3;
+  map<string, double> rule_weight = 4; // 规则 ID → 权重系数（<1 降权，误报纠正）
+  repeated string block_targets = 5;   // 研判恶意目标（host 或 host+path 前缀）
+}
+
+message Ack {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 事件
+// ---------------------------------------------------------------------------
+
+message WatchRequest {
+  int32 max_inflight = 1;          // 背压：允许的在途事件上限
+}
+
+message ThreatEvent {
+  string trace_id = 1;             // 全链路贯通 ID（见 docs/contract.md）
+  int64 ts = 2;                    // unix 秒
+  string kind = 3;                 // detect | switch | circuit | verdict
+  string ctx = 4;                  // "request" | "response"
+  string target = 5;               // host + path
+  repeated RuleHit hits = 6;
+  bytes sample = 7;                // ≤4KB，进研判队列用
+  string proxy_used = 8;           // 命中时的出口
+  string action_taken = 9;         // blocked | warned | switched | logged | passed
+}
+
+message RuleHit {
+  string rule_id = 1;
+  string rule_name = 2;
+  string severity = 3;             // low | medium | high | critical
+  string snippet = 4;              // ≤120 字符
+}
+
+// ---------------------------------------------------------------------------
+// 指标
+// ---------------------------------------------------------------------------
+
+message MetricBatch {
+  int64 ts = 1;
+  uint64 requests_total = 2;
+  uint64 blocked_total = 3;
+  uint64 switched_total = 4;
+  int32 pool_active = 5;           // 数据面视角的可用出口数
+  int32 pool_total = 6;
+  double avg_upstream_ms = 7;
+  map<string, int64> extras = 8;
+}
+
+// ---------------------------------------------------------------------------
+// 研判回写（Python → Go）
+// ---------------------------------------------------------------------------
+
+message VerdictUpdate {
+  string trace_id = 1;
+  string verdict = 2;              // malicious | suspicious | benign
+  string attack_type = 3;
+  string reason = 4;               // ≤50 字
+  double confidence = 5;           // 0.0 - 1.0
+  int64 ts = 6;
+  string model = 7;                // 研判所用模型
+  string target = 8;               // host 或 host+path（malicious 时 Go 据此封锁）
+}

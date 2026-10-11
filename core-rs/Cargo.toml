@@ -1,0 +1,25 @@
+[package]
+name = "proxy-guard-core"
+version = "0.1.0"
+edition = "2021"
+description = "Proxy Guard Agent — Rust 数据面核心（高性能/安全边界）"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+regex = "1"
+anyhow = "1"
+rand = "0.8"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = true
+strip = true

@@ -55,3 +55,7 @@ dist/
 build/
 *.zip
 *.tar.gz
+
+# ---- v2 构建产物（Rust / Go）----
+core-rs/target/
+ctrl-go/bin/
