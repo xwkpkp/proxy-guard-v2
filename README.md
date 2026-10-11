@@ -61,7 +61,22 @@ proxy-guard/
 
 ## 快速开始（v2）
 
-### 构建
+### 方式一：下载即用（Windows x64）
+
+从 [Releases](https://github.com/xwkpkp/proxy-guard-v2/releases) 下载
+`proxy-guard-v2-windows-x64.zip`，解压后开两个终端：
+
+```powershell
+# 终端 A：数据面
+.\proxy-guard-core.exe --listen 127.0.0.1:8888 --ctrl-port 8890 --rules rules
+
+# 终端 B：控制面
+.\guardctl.exe run -c config.yaml
+```
+
+Python AI 层为可选组件（需要 Python 3.10+），步骤见包内 `START-HERE.txt`。
+
+### 方式二：从源码构建
 
 ```bash
 # 1) Rust 数据面（需要 Rust 工具链）
